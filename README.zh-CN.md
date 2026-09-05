@@ -82,13 +82,21 @@ window.JSRayWP.renderer = {
 
 ## 安装
 
-把插件目录复制到:
+从[最新 Release](https://github.com/jsrayorg/jsray-wp/releases/latest)下载
+`jsray-wp-<版本>.zip`。在 WordPress 后台:**插件 → 安装插件 → 上传插件**,
+选择该 zip,安装后启用 **JSRay**。
 
-```text
-wp-content/plugins/jsray
+尚未上架 wordpress.org。
+
+Release 里随 zip 一并发布了校验和,上传到线上站点之前可以先核对:
+
+```sh
+shasum -a 256 -c SHA256SUMS.txt
 ```
 
-然后在 WordPress 后台启用 **JSRay**。
+### 从源码安装
+
+把插件目录复制到 `wp-content/plugins/jsray`,然后在 WordPress 后台启用 **JSRay**。
 
 ## 配置
 
