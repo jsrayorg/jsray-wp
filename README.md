@@ -100,8 +100,6 @@ Download `jsray-wp-<version>.zip` from the
 WordPress admin: **Plugins → Add New → Upload Plugin**, choose the zip, install,
 then activate **JSRay**.
 
-Not on WordPress.org yet.
-
 The release publishes checksums beside the zip, so the archive can be checked
 before it is uploaded to a live site:
 

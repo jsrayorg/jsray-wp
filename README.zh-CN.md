@@ -86,8 +86,6 @@ window.JSRayWP.renderer = {
 `jsray-wp-<版本>.zip`。在 WordPress 后台:**插件 → 安装插件 → 上传插件**,
 选择该 zip,安装后启用 **JSRay**。
 
-尚未上架 wordpress.org。
-
 Release 里随 zip 一并发布了校验和,上传到线上站点之前可以先核对:
 
 ```sh
