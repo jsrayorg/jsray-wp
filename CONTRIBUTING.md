@@ -54,7 +54,7 @@ patch is never released twice, so a counter would carry no information —
 Core keeps one because its betas iterate within a patch, this does not.
 
 ```
-0.0.1-beta → 0.0.1-beta → 0.0.3-beta.1 → … → 0.1.0
+0.0.1-beta → 0.0.2-beta → 0.0.3-beta → … → 0.1.0
 ```
 
 `0.1.0` is where the beta label comes off, and it is the version that goes to
