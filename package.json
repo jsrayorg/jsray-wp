@@ -14,7 +14,7 @@
     "url": "https://github.com/jsrayorg/jsray-wp/issues"
   },
   "scripts": {
-    "build": "sh tools/build-plugin.sh",
+    "build": "node tools/check-core-freshness.mjs --strict && sh tools/build-plugin.sh",
     "check:versions": "node tools/check-versions.mjs",
     "test": "node --test tests/*.mjs",
     "build:pot": "node tools/make-pot.mjs",
