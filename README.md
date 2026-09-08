@@ -95,13 +95,22 @@ window.JSRayWP.renderer = {
 
 ## Install
 
-Copy this plugin directory to:
+Download `jsray-wp-<version>.zip` from the
+[latest release](https://github.com/jsrayorg/jsray-wp/releases/latest). In the
+WordPress admin: **Plugins → Add New → Upload Plugin**, choose the zip, install,
+then activate **JSRay**.
 
-```text
-wp-content/plugins/jsray
+The release publishes checksums beside the zip, so the archive can be checked
+before it is uploaded to a live site:
+
+```sh
+shasum -a 256 -c SHA256SUMS.txt
 ```
 
-Then activate **JSRay** in the WordPress admin.
+### From source
+
+Copy this plugin directory to `wp-content/plugins/jsray`, then activate
+**JSRay** in the WordPress admin.
 
 ## Configure
 
