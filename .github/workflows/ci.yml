@@ -74,8 +74,16 @@ jobs:
         run: npm run check:core
       - name: Run tests
         run: npm test
+      # `npm run build` gates on a fresh Core (`--strict`), which is the right
+      # rule for shipping a zip and the wrong one for every commit: an
+      # integration syncs Core as part of its own release, so being behind
+      # between releases is the expected state and must not turn CI red. The
+      # packaging script is called directly here, because what this step needs
+      # to prove is that the zip still builds. This repository was the only one
+      # of the three wiring the packaging gate into ordinary CI, and it went
+      # unnoticed because the last push predated Core moving ahead.
       - name: Build plugin zip
-        run: npm run build
+        run: sh tools/build-plugin.sh
 
   php-lint:
     name: PHP syntax (${{ matrix.php }})
