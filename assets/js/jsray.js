@@ -18,45 +18,148 @@
   const escapeHtml = (s) => s.replace(/[&<>"]/g, (c) => escapeMap[c]);
 
   /**
-   * Apply grammar rules to a string in order. Rule array order = priority (first-match wins).
+   * Apply grammar rules to a string in order. Rule array order = priority
+   * (first-match wins), except among adjacent rules sharing a group.
    * Each rule:
    *   { cls: 'tk-xxx',
    *     pattern: /re/,         // must be globalizable; the 'g' flag is forced internally
    *     inside?: rules,        // nested grammar (recursively tokenize captured text)
-   *     lookbehind?: true }    // capture group 1 is consumed as prefix but not colored
+   *     lookbehind?: true,     // capture group 1 is consumed as prefix but not colored
+   *     close?: fn,            // pattern matches the opening only; fn finds the end
+   *     group?: 'name' }       // adjacent rules sharing a name compete by position
+   *
+   * `close(match, text, from) -> index | -1` exists for the forms whose end is
+   * not knowable when the rule is written. A heredoc ends at the word its own
+   * opening line named — `<<<EOT` at EOT, `<<<SQL` at SQL — and `%w[…]` ends
+   * at the bracket matching the one that opened it. No single RegExp can say
+   * that, which is why these forms rendered as ordinary code until now.
+   * Returning -1 means "no terminator here": the opening is left to the rules
+   * behind this one rather than swallowing the rest of the file, because a
+   * false opening is likelier than a genuinely unterminated literal.
+   *
+   * `group` exists because order cannot decide between a string and a
+   * comment. Strings first reads `// don't stop, won't stop` as a comment
+   * holding the string `'t stop, won'`; comments first reads
+   * `"https://jsray.org"` as a string holding a comment. Every grammar here had
+   * picked one of those two failures and written the choice down beside its
+   * rules as though it were the fix. The language decides by position —
+   * whichever opens first owns the text up to its own end — so the rules of a
+   * group run as one pass in which the earliest match wins at every step, and
+   * listed order only breaks a tie at the same index (which is how `/**` still
+   * beats `/*`). Positions are compared where the whole match begins, lookbehind
+   * prefix included: a heredoc's body starts on the next line, and measured
+   * from there `cat <<EOF > "out.txt"` would lose its `<<` to the quoted name.
    */
   function tokenize(code, rules) {
     let stream = [code];
-    for (const rule of rules) {
-      const next = [];
-      // Compile once per rule and cache on the rule object — the old code
-      // built a fresh RegExp per stream piece, which dominated tokenize time
-      // on fragmented streams. lastIndex is reset per piece instead.
-      const re = rule._re || (rule._re = new RegExp(
-        rule.pattern.source,
-        (rule.pattern.flags || '').replace('g', '') + 'g'
-      ));
-      for (const piece of stream) {
-        if (typeof piece !== 'string') { next.push(piece); continue; }
-        re.lastIndex = 0;
-        let last = 0, m;
-        while ((m = re.exec(piece)) !== null) {
-          const lbLen = rule.lookbehind && m[1] ? m[1].length : 0;
-          const start = m.index + lbLen;
-          const text = m[0].slice(lbLen);
-          if (!text) { re.lastIndex++; continue; }
-          if (start > last) next.push(piece.slice(last, start));
-          next.push({
-            type: rule.cls,
-            content: rule.inside ? tokenize(text, rule.inside) : text,
-          });
-          last = start + text.length;
-        }
-        if (last < piece.length) next.push(piece.slice(last));
+    for (let r = 0; r < rules.length; ) {
+      const rule = rules[r];
+      if (!rule.group) {
+        stream = applyRule(stream, rule);
+        r++;
+        continue;
       }
-      stream = next;
+      let end = r + 1;
+      while (end < rules.length && rules[end].group === rule.group) end++;
+      stream = applyGroup(stream, rules.slice(r, end));
+      r = end;
     }
     return stream;
+  }
+
+  function compile(rule) {
+    // Compile once per rule and cache on the rule object — the old code
+    // built a fresh RegExp per stream piece, which dominated tokenize time
+    // on fragmented streams. lastIndex is reset per piece instead.
+    return rule._re || (rule._re = new RegExp(
+      rule.pattern.source,
+      (rule.pattern.flags || '').replace('g', '') + 'g'
+    ));
+  }
+
+  function applyRule(stream, rule) {
+    const next = [];
+    const re = compile(rule);
+    for (const piece of stream) {
+      if (typeof piece !== 'string') { next.push(piece); continue; }
+      re.lastIndex = 0;
+      let last = 0, m;
+      while ((m = re.exec(piece)) !== null) {
+        const lbLen = rule.lookbehind && m[1] ? m[1].length : 0;
+        const start = m.index + lbLen;
+        let text = m[0].slice(lbLen);
+        if (rule.close) {
+          const end = rule.close(m, piece, m.index + m[0].length);
+          if (end < 0) { re.lastIndex = m.index + 1; continue; }
+          text = piece.slice(start, end);
+        }
+        if (!text) { re.lastIndex++; continue; }
+        if (start > last) next.push(piece.slice(last, start));
+        next.push({
+          type: rule.cls,
+          content: rule.inside ? tokenize(text, rule.inside) : text,
+        });
+        last = start + text.length;
+        // The body of a close-delimited form has already been consumed;
+        // resuming inside it would re-match its own contents.
+        if (rule.close) re.lastIndex = last;
+      }
+      if (last < piece.length) next.push(piece.slice(last));
+    }
+    return next;
+  }
+
+  /** The first acceptable match of `rule` at or after `from`, or null. */
+  function locate(rule, piece, from) {
+    const re = compile(rule);
+    re.lastIndex = from;
+    let m;
+    while ((m = re.exec(piece)) !== null) {
+      const lbLen = rule.lookbehind && m[1] ? m[1].length : 0;
+      const start = m.index + lbLen;
+      let text = m[0].slice(lbLen);
+      if (rule.close) {
+        const end = rule.close(m, piece, m.index + m[0].length);
+        if (end < 0) { re.lastIndex = m.index + 1; continue; }
+        text = piece.slice(start, end);
+      }
+      if (!text) { re.lastIndex = m.index + 1; continue; }
+      return { index: m.index, start, text };
+    }
+    return null;
+  }
+
+  function applyGroup(stream, group) {
+    const next = [];
+    for (const piece of stream) {
+      if (typeof piece !== 'string') { next.push(piece); continue; }
+      // One cursor per rule, kept until the text it points into has been
+      // claimed by another rule. Cursors only move forward, so a pass costs
+      // about what running the same rules one after another did.
+      const hits = new Array(group.length);
+      let pos = 0;
+      for (;;) {
+        let win = -1;
+        for (let i = 0; i < group.length; i++) {
+          const hit = hits[i];
+          if (hit === undefined || (hit !== null && hit.index < pos)) {
+            hits[i] = locate(group[i], piece, pos);
+          }
+          if (hits[i] && (win < 0 || hits[i].index < hits[win].index)) win = i;
+        }
+        if (win < 0) break;
+        const { start, text } = hits[win];
+        const rule = group[win];
+        if (start > pos) next.push(piece.slice(pos, start));
+        next.push({
+          type: rule.cls,
+          content: rule.inside ? tokenize(text, rule.inside) : text,
+        });
+        pos = start + text.length;
+      }
+      if (pos < piece.length) next.push(piece.slice(pos));
+    }
+    return next;
   }
 
   function render(stream) {
@@ -73,6 +176,60 @@
   // ============================================================
 
   const G = {}; // grammars
+
+  // ---------- runtime terminators ----------
+  // Two `close` builders cover every delimited form the grammars below need.
+  // Both take the opening match and report where the form ends.
+
+  /**
+   * A heredoc ends at the word its opening line named. `nameGroup` is the
+   * capture holding that word; `indentGroup` is the capture holding the `-` or
+   * `~` that permits an indented terminator (pass `true` where the language
+   * always permits one, as PHP does since 7.3). `trailing` overrides what may
+   * follow the word on its closing line.
+   *
+   * The name is interpolated into a RegExp, which is only safe because every
+   * opening pattern here restricts it to `[A-Za-z_]\w*` — no metacharacters
+   * can reach this.
+   */
+  function heredocEnd(nameGroup, indentGroup, trailing) {
+    return (m, text, from) => {
+      const name = m[nameGroup];
+      if (!name) return -1;
+      const indented = indentGroup === true ? true : !!m[indentGroup];
+      const re = new RegExp(
+        '^' + (indented ? '[ \\t]*' : '') + name + (trailing || '[ \\t]*$'),
+        'm'
+      );
+      const hit = re.exec(text.slice(from));
+      return hit ? from + hit.index + hit[0].length : -1;
+    };
+  }
+
+  const CLOSERS = { '(': ')', '[': ']', '{': '}', '<': '>' };
+
+  /**
+   * A delimiter-chosen literal — Ruby's `%w[…]`, Perl's `q{…}`, an Elixir
+   * sigil — ends at whatever closes the character it opened with. Bracket
+   * pairs nest; a symmetric delimiter such as `%w!…!` cannot, and counting
+   * depth on one would end the literal at its own opening character.
+   */
+  function pairedEnd(openGroup) {
+    return (m, text, from) => {
+      const open = m[openGroup];
+      if (!open) return -1;
+      const close = CLOSERS[open] || open;
+      const nests = close !== open;
+      let depth = 1;
+      for (let i = from; i < text.length; i++) {
+        const c = text[i];
+        if (c === '\\') { i++; continue; }
+        if (nests && c === open) depth++;
+        else if (c === close && --depth === 0) return i + 1;
+      }
+      return -1;
+    };
+  }
 
   // ---------- shared fragments ----------
   const RX = {
@@ -111,30 +268,41 @@
   ).split(' ');
 
   // Parameter-list sub-grammar · colors n / name in (n: number, name = "x") as var-param
+  //
+  // A parameter list is claimed where it opens, ahead of any comment or string
+  // default inside it, so this is the first grammar to see those. They are
+  // taken before punctuation can split them at a comma.
   const jsParamInside = [
+    { cls: 'tk-comment',   pattern: /\/\*[\s\S]*?\*\/|\/\/.*/, group: 'span' },
+    { cls: 'tk-string',    pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/, group: 'span' },
     { cls: 'tk-punct',     pattern: /[(),]/ },
     { cls: 'tk-type',      pattern: /(:\s*)[A-Z][\w$]*/, lookbehind: true },
     { cls: 'tk-keyword',   pattern: /\b(?:number|string|boolean|void|null|undefined|any|unknown|never|true|false)\b/ },
-    { cls: 'tk-string',    pattern: /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/ },
     { cls: 'tk-number',    pattern: /\b\d[\d_]*(?:\.\d+)?\b/ },
     { cls: 'tk-var-param', pattern: /\b[A-Za-z_$][\w$]*\b/ },
     { cls: 'tk-operator',  pattern: /[=?:.]/ },
   ];
 
   G.javascript = [
-    // Doc comments must come before plain block comments. Block comments stay
-    // before strings; LINE comments come after strings (see below) so
-    // "https://..." inside a string never becomes a comment.
-    { cls: 'tk-doc',     pattern: /\/\*\*[\s\S]*?\*\// },
-    { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\// },
+    // Everything that opens a span — doc and block comments, parameter lists,
+    // strings, line comments, regex literals — competes by position (see
+    // `group` in tokenize). Listed order only breaks ties at one index: `/**`
+    // before `/*`, and `//` before a regex, which cannot begin with `//`.
+    //
+    // A parameter list is a span too. Ahead of the comments it would read
+    // `function f(a, b)` inside a doc comment as a real signature; behind the
+    // strings it could not match `(a = "x")` once the default was split off.
+    // Competing, it is claimed only where it opens first.
+    { cls: 'tk-doc',     pattern: /\/\*\*[\s\S]*?\*\//, group: 'span' },
+    { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\//, group: 'span' },
 
     // Parameter lists · function foo(...) / (...) => / async (...) =>
     { cls: 'tk-scope',
       pattern: /(\bfunction\s*[\w$]*\s*)\([^()]*\)/, lookbehind: true,
-      inside: jsParamInside },
+      inside: jsParamInside, group: 'span' },
     { cls: 'tk-scope',
       pattern: /\([^()]*\)(?=\s*=>)/,
-      inside: jsParamInside },
+      inside: jsParamInside, group: 'span' },
 
     // Template strings (with inline ${...})
     //
@@ -144,22 +312,44 @@
     // engine try every combination: 26 placeholders took 8.7s to fail. Every
     // interpolating grammar below keeps its fallback and its interpolation
     // branch disjoint for the same reason.
-    { cls: 'tk-string',  pattern: /`(?:\\.|\$\{[^}]*\}|\$(?!\{)|[^`\\$])*`/, inside: [
-        { cls: 'tk-operator', pattern: /\$\{[^}]*\}/, inside: [
-            { cls: 'tk-punct', pattern: /^\$\{|\}$/ },
-            // No JS recursion here; minimal coloring avoids rule cross-talk
-            { cls: 'tk-var',   pattern: /[A-Za-z_$][\w$]*/ },
+    //
+    // A placeholder may hold a template of its own — `${ok ? `a ${b}` : 'c'}`
+    // and `${items.map((x) => `<li>${x}</li>`)}` are ordinary JavaScript — and
+    // one level of braces, as in `${fn({ a })}`. The old `\$\{[^}]*\}` stopped
+    // at the inner template's first `}`, so the outer template ended at the
+    // inner one's closing backtick and its own closing backtick was left over.
+    // Once spans compete by position, that leftover opens a template running
+    // to the next backtick in the file, and everything between reads inverted.
+    // Inside a placeholder each alternative still begins with its own
+    // character — a brace, a backtick, or neither — so there is one parse.
+    // The operator pattern below is the placeholder branch of this one.
+    { cls: 'tk-string',  pattern: /`(?:\\.|\$\{(?:[^{}`]|\{[^{}]*\}|`(?:\\.|\$\{[^{}]*\}|\$(?!\{)|[^`\\$])*`)*\}|\$(?!\{)|[^`\\$])*`/, group: 'span', inside: [
+        { cls: 'tk-operator', pattern: /\$\{(?:[^{}`]|\{[^{}]*\}|`(?:\\.|\$\{[^{}]*\}|\$(?!\{)|[^`\\$])*`)*\}/, inside: [
+            { cls: 'tk-punct',  pattern: /^\$\{|\}$/ },
+            // A nested template or a quoted string inside a placeholder is a
+            // string, not a run of variables. No JS recursion beyond that;
+            // minimal coloring avoids rule cross-talk.
+            { cls: 'tk-string', pattern: /`(?:\\.|\$\{[^{}]*\}|\$(?!\{)|[^`\\$])*`|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/ },
+            { cls: 'tk-var',    pattern: /[A-Za-z_$][\w$]*/ },
         ]},
     ]},
-    { cls: 'tk-string',  pattern: RX.string1 },
-    { cls: 'tk-string',  pattern: RX.string2 },
-    { cls: 'tk-comment', pattern: /\/\/.*/ },
+    { cls: 'tk-string',  pattern: RX.string1, group: 'span' },
+    { cls: 'tk-string',  pattern: RX.string2, group: 'span' },
+    { cls: 'tk-comment', pattern: /\/\/.*/, group: 'span' },
 
     // Regex: only recognize after =/(/,/!/keyword to avoid eating division
     // Capture prefix whitespace as lookbehind so it stays outside the regex token.
+    // In the span group because a regex may hold a quote: `s.split(/"/)` read
+    // as the start of a string took the rest of the line with it.
     { cls: 'tk-regex',
       pattern: /(^|[=(,!&|?:;{}\[\]]\s*|\breturn\s*)\/(?![*\/])(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^\/\\\n])+\/[gimsuy]*/,
-      lookbehind: true },
+      lookbehind: true, group: 'span' },
+
+    // Private class members — `#count`, `this.#count`, `#count in obj`. The
+    // `#` belongs to the name, and the rule precedes the type and constant
+    // rules, which would otherwise take `#Foo` apart at the word boundary.
+    // A shebang's `#!` is not a name and is left alone.
+    { cls: 'tk-property', pattern: /#[A-Za-z_$][\w$]*/ },
 
     // Decorators
     { cls: 'tk-decorator', pattern: /@[A-Za-z_$][\w$]*/ },
@@ -233,9 +423,11 @@
   ];
 
   G.python = [
-    // Triple-quoted strings (with f/r/b prefixes). All strings before
-    // comments so # inside "..." never becomes a comment.
-    { cls: 'tk-string',  pattern: /(?:[rRbBuUfF]{0,2})("""[\s\S]*?"""|'''[\s\S]*?''')/ },
+    // Strings and comments compete by position (see `group` in tokenize), so
+    // `#` inside "..." stays text and a quote inside a comment stays comment.
+    // Triple-quoted strings (with f/r/b prefixes) are listed first: at the
+    // same index they must win over `""` followed by a lone quote.
+    { cls: 'tk-string',  pattern: /(?:[rRbBuUfF]{0,2})("""[\s\S]*?"""|'''[\s\S]*?''')/, group: 'span' },
     // PEP 701 lets a replacement field carry the same quote that delimits the
     // string: `f"{a["k"]}"` is valid from Python 3.12. The general rule below
     // stops at the first inner quote, which split one string into two tokens
@@ -248,9 +440,9 @@
     // is deliberately left to fall through to the general rule: covering it
     // needs a nested quantifier, which is the ambiguous shape that caused the
     // beta.4 denial of service.
-    { cls: 'tk-string',  pattern: /(?:[rRbB][fF]|[fF][rRbB]?)("(?:\{[^{}]*\}|\\.|[^"\\\n{])*"|'(?:\{[^{}]*\}|\\.|[^'\\\n{])*')/ },
-    { cls: 'tk-string',  pattern: /(?:[rRbBuUfF]{0,2})("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    { cls: 'tk-string',  pattern: /(?:[rRbB][fF]|[fF][rRbB]?)("(?:\{[^{}]*\}|\\.|[^"\\\n{])*"|'(?:\{[^{}]*\}|\\.|[^'\\\n{])*')/, group: 'span' },
+    { cls: 'tk-string',  pattern: /(?:[rRbBuUfF]{0,2})("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
 
     // Parameter list · def foo(self, n: int = 0)
     { cls: 'tk-scope',
@@ -368,8 +560,13 @@
     { cls: 'tk-punct',    pattern: /[{}[\]:,]/ },
   ];
   G.jsonc = [
-    { cls: 'tk-comment',  pattern: /\/\*[\s\S]*?\*\/|\/\/.*/ },
-    ...G.json,
+    // Comments and strings compete by position (see `group` in tokenize). The
+    // old order put comments first, so a value such as "https://jsray.org" —
+    // everywhere in editor settings and tsconfig files — was cut at its `//`.
+    { cls: 'tk-comment',  pattern: /\/\*[\s\S]*?\*\/|\/\/.*/, group: 'span' },
+    { cls: 'tk-type',     pattern: /"(?:\\.|[^"\\])*"(?=\s*:)/, group: 'span' },
+    { cls: 'tk-string',   pattern: /"(?:\\.|[^"\\])*"/, group: 'span' },
+    ...G.json.filter((rule) => rule.cls !== 'tk-type' && rule.cls !== 'tk-string'),
   ];
 
   // ============================================================
@@ -386,15 +583,27 @@
     'docker kubectl python python3 pip pip3 ruby go cargo make brew apt yum';
 
   G.shell = [
-    // Strings before comments, else # inside "..." is eaten as a comment.
+    // Heredocs first: their body may hold quotes and `#`, and every rule
+    // after this one would claim those. The opening line is group 1 and is
+    // consumed as an uncolored prefix, so `cat <<EOF > out.txt` keeps its
+    // redirect as shell rather than dragging it into the literal.
+    { cls: 'tk-string',
+      pattern: /(<<(-?)[ \t]*(['"]?)([A-Za-z_]\w*)\3[^\n]*\n)/,
+      lookbehind: true,
+      close: heredocEnd(4, 2),
+      group: 'span' },
+
+    // Strings, heredocs and comments compete by position (see `group` in
+    // tokenize): `#` inside "..." stays text, a quote in a comment stays
+    // comment, and `# cat <<EOF` in a comment opens nothing.
     // Each `$` form is matched exactly, never by a greedy run that could also
     // swallow the ones after it — the old `\$[\w{][^"\n]*` overlapped itself
     // and an unterminated string took two minutes to fail on 26 variables.
-    { cls: 'tk-string',  pattern: /"(?:\\.|\$\{[^}\n]*\}|\$\w+|\$(?![\w{])|[^"\\$\n])*"/, inside: [
+    { cls: 'tk-string',  pattern: /"(?:\\.|\$\{[^}\n]*\}|\$\w+|\$(?![\w{])|[^"\\$\n])*"/, group: 'span', inside: [
         { cls: 'tk-var-builtin', pattern: /\$\{[^}]+\}|\$\w+/ },
     ]},
-    { cls: 'tk-string',  pattern: /'[^'\n]*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    { cls: 'tk-string',  pattern: /'[^'\n]*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
 
     { cls: 'tk-var-builtin', pattern: /\$\{[^}]+\}|\$\w+|\$[#?@*]/ },
 
@@ -431,15 +640,27 @@
   ).split(' ');
 
   G.php = [
-    // Block comments before strings; line comments (// and #) after strings
-    // so "https://..." and "#anchor" inside strings never become comments.
-    { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\// },
-    { cls: 'tk-decorator', pattern: /<\?(?:php|=)?|\?>/i },
-    { cls: 'tk-string', pattern: /"(?:\\.|\$[A-Za-z_]\w*|[^"\\$\n])*"/, inside: [
+    // Heredoc and nowdoc ahead of the comment rules: `#` and `//` are
+    // ordinary text inside one. The closing word may be indented and may be
+    // followed by `;` or `,`, which is why the terminator ends at a word
+    // boundary rather than at end of line.
+    { cls: 'tk-string',
+      pattern: /(<<<[ \t]*(['"]?)([A-Za-z_]\w*)\2\r?\n)/,
+      lookbehind: true,
+      close: heredocEnd(3, true, '\\b'),
+      group: 'span' },
+
+    // Comments and strings compete by position (see `group` in tokenize), so
+    // "https://..." and "#anchor" stay strings, "/* x */" stays a string, and
+    // a quote inside a comment stays comment.
+    { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\//, group: 'span' },
+    { cls: 'tk-string', pattern: /"(?:\\.|\$[A-Za-z_]\w*|[^"\\$\n])*"/, group: 'span', inside: [
         { cls: 'tk-var', pattern: /\$[A-Za-z_]\w*/ },
     ]},
-    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/ },
-    { cls: 'tk-comment', pattern: /\/\/.*|#.*/ },
+    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /\/\/.*|#.*/, group: 'span' },
+    // Open and close tags after the spans, so "?>" inside a string is text.
+    { cls: 'tk-decorator', pattern: /<\?(?:php|=)?|\?>/i },
     { cls: 'tk-var', pattern: /\$[A-Za-z_]\w*/ },
     { cls: 'tk-var-const', pattern: /\b[A-Z][A-Z0-9_]{2,}\b/ },
     { cls: 'tk-type', pattern: /(\b(?:class|interface|trait|enum|extends|implements|new)\s+)[A-Za-z_]\w*/, lookbehind: true },
@@ -466,16 +687,23 @@
   function cLikeGrammar(keywords, builtins, options) {
     const opts = options || {};
     const rules = [
-      // Block comments stay before strings (license headers quote freely);
-      // LINE comments come after strings so "https://..." never becomes a
+      // Comments, strings and preprocessor lines compete by position (see
+      // `group` in tokenize): a license header can quote freely, a string can
+      // hold `/* … */` or `https://`, and a comment can hold `don't` twice.
+      // The option blocks below splice their literals in among these, in the
+      // same group.
+      //
+      // A preprocessor line is a span because it runs to the end of its line:
+      // `#include "a.h"` keeps its path, and a commented-out `#define` stays a
       // comment.
-      { cls: 'tk-doc', pattern: /\/\*\*[\s\S]*?\*\// },
-      { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\// },
-      { cls: 'tk-decorator', pattern: /^\s*#\s*[A-Za-z_]\w*.*/m },
+      { cls: 'tk-doc', pattern: /\/\*\*[\s\S]*?\*\//, group: 'span' },
+      { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\//, group: 'span' },
+      { cls: 'tk-decorator', pattern: /^\s*#\s*[A-Za-z_]\w*.*/m, group: 'span' },
+      { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"/, group: 'span' },
+      { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/, group: 'span' },
+      { cls: 'tk-comment', pattern: /\/\/.*/, group: 'span' },
+      // Annotations come after the spans, so `// see @Override` stays a comment.
       { cls: 'tk-decorator', pattern: /@[A-Za-z_]\w*/ },
-      { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"/ },
-      { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/ },
-      { cls: 'tk-comment', pattern: /\/\/.*/ },
       { cls: 'tk-var-const', pattern: /\b[A-Z][A-Z0-9_]{2,}\b/ },
       { cls: 'tk-type', pattern: /(\b(?:class|struct|interface|enum|trait|extends|implements|namespace|using|new|object|protocol|extension|mixin|record|actor)\s+)[A-Za-z_]\w*/, lookbehind: true },
       { cls: 'tk-fn-decl', pattern: new RegExp('\\b(?!(?:' + CLIKE_DECL_SKIP + ')\\b)[A-Za-z_]\\w*(?=\\s*\\([^;{}]*\\)\\s*(?:const\\s*)?(?:->\\s*[A-Za-z_:][\\w:<>]*)?\\{)') },
@@ -514,6 +742,7 @@
       rules.splice(rules.findIndex((r) => r.cls === 'tk-string'), 0, {
         cls: 'tk-string',
         pattern: /`[^`]*`/,
+        group: 'span',
       });
     }
 
@@ -533,6 +762,7 @@
       rules.splice(rules.findIndex((r) => r.cls === 'tk-string'), 0, {
         cls: 'tk-string',
         pattern: /\b(?:[uU]8?|[LU])?R"([^\s()\\]{0,16})\([\s\S]*?\)\1"/,
+        group: 'span',
       });
     }
 
@@ -540,6 +770,7 @@
       rules.splice(rules.findIndex((r) => r.cls === 'tk-string'), 0, {
         cls: 'tk-string',
         pattern: /\b(?:b?r)(#{0,16})"[\s\S]*?"\1/,
+        group: 'span',
       });
     }
 
@@ -552,6 +783,7 @@
       rules.splice(rules.findIndex((r) => r.cls === 'tk-string'), 0, {
         cls: 'tk-string',
         pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''/,
+        group: 'span',
       });
     }
 
@@ -564,8 +796,8 @@
     // preceded: leaving it in place would keep one pattern around that can
     // still span from any apostrophe to any later one.
     if (opts.lifetimes) {
-      // The character literal stays where the string rule was, because it is a
-      // string and line comments deliberately come after strings.
+      // The character literal takes the string rule's place in the span group,
+      // because it is a string.
       const quoted = rules.findIndex(
         (r) => r.cls === 'tk-string' && r.pattern.source[0] === "'"
       );
@@ -573,6 +805,7 @@
         // Exactly one character or one escape, then the closing quote.
         cls: 'tk-string',
         pattern: /'(?:\\(?:u\{[\da-fA-F]{1,6}\}|.)|[^'\\\n])'/,
+        group: 'span',
       });
 
       // The lifetime goes AFTER the line-comment rule, and the distance between
@@ -732,22 +965,47 @@
   const RB_BUILTINS = 'puts print p gets raise lambda proc loop each map select reject reduce new'.split(' ');
 
   G.ruby = [
-    // `=begin` / `=end` blocks come before the strings that come before
-    // everything else. The markers are only special at column zero, so the
-    // anchors here are load-bearing rather than decorative. Without this rule
-    // a documentation block was read as ordinary code — the body's words came
-    // out coloured as function calls and keywords.
-    { cls: 'tk-comment', pattern: /^=begin\b[\s\S]*?^=end.*$/m },
-    // Strings must come before comments, else # inside "..." (incl. #{} interpolation)
-    // is eaten as a comment. String bodies stay single-line so an unpaired quote
-    // in a comment can't swallow following lines.
+    // Heredocs, and only with an uppercase word: `<<` is also the append
+    // operator, and `items << thing` must not open one. An uppercase name is
+    // the convention, and where a constant does follow `<<` the terminator
+    // line will not exist, so the form declines itself rather than eating the
+    // file. `<<~` and `<<-` permit an indented terminator; plain `<<` does not.
+    { cls: 'tk-string',
+      pattern: /(<<([-~]?)(['"]?)([A-Z_]\w*)\3[^\n]*\n)/,
+      lookbehind: true,
+      close: heredocEnd(4, 2),
+      group: 'span' },
+
+    // `=begin` / `=end` blocks. The markers are only special at column zero,
+    // so the anchors here are load-bearing rather than decorative. Without
+    // this rule a documentation block was read as ordinary code — the body's
+    // words came out coloured as function calls and keywords.
+    { cls: 'tk-comment', pattern: /^=begin\b[\s\S]*?^=end.*$/m, group: 'span' },
+
+    // %w[…] %i(…) %q{…} %Q<…>: the delimiter is picked at the call site, so
+    // the closer is only knowable once the opener has been read, and bracket
+    // pairs nest. %r is a regex, not a string. The bare `%(…)` form is left
+    // out on purpose — it cannot be told from the modulo operator without
+    // parsing, and it is rare enough not to be worth mistaking `a %(b)` for a
+    // literal.
+    //
+    // These sat ahead of the comment rule in beta.4, which is how
+    // `# prefer %w[a b]` lost the rest of its comment. In the span group they
+    // are claimed only where they open before a `#` does.
+    { cls: 'tk-regex',  pattern: /%r([([{<|!\/])/, close: pairedEnd(1), group: 'span' },
+    { cls: 'tk-string', pattern: /%[wWiIqQsx]([([{<|!\/])/, close: pairedEnd(1), group: 'span' },
+
+    // Strings and comments compete by position (see `group` in tokenize), so
+    // `#` inside "..." (incl. #{} interpolation) stays text and a quote inside
+    // a comment stays comment. String bodies stay single-line so an unpaired
+    // quote can't swallow following lines.
     // Fallback excludes `#`; a bare `#` is admitted only when no `{` follows,
     // so `#{...}` has exactly one parse (see the JS template-string note).
-    { cls: 'tk-string', pattern: /"(?:\\.|#\{[^}\n]*\}|#(?!\{)|[^"\\\n#])*"/, inside: [
+    { cls: 'tk-string', pattern: /"(?:\\.|#\{[^}\n]*\}|#(?!\{)|[^"\\\n#])*"/, group: 'span', inside: [
         { cls: 'tk-operator', pattern: /#\{[^}\n]*\}/ },
     ]},
-    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-var-builtin', pattern: /[@$]{1,2}[A-Za-z_]\w*|\bself\b/ },
     { cls: 'tk-var-const', pattern: /\b[A-Z][A-Z0-9_]{2,}\b/ },
     { cls: 'tk-type', pattern: /(\b(?:class|module)\s+)[A-Z]\w*/, lookbehind: true },
@@ -774,13 +1032,14 @@
   ).split(' ');
 
   G.lua = [
-    // Block comments before strings; line comments after strings so
-    // "not -- a comment" stays a string.
-    { cls: 'tk-comment', pattern: /--\[\[[\s\S]*?\]\]/ },
-    { cls: 'tk-string',  pattern: /\[\[[\s\S]*?\]\]/ },
-    { cls: 'tk-string',  pattern: /"(?:\\.|[^"\\\n])*"/ },
-    { cls: 'tk-string',  pattern: /'(?:\\.|[^'\\\n])*'/ },
-    { cls: 'tk-comment', pattern: /--.*/ },
+    // Comments and strings compete by position (see `group` in tokenize), so
+    // "not -- a comment" stays a string and `-- don't` stays a comment. The
+    // long comment is listed ahead of the line comment: both open at `--`.
+    { cls: 'tk-comment', pattern: /--\[\[[\s\S]*?\]\]/, group: 'span' },
+    { cls: 'tk-string',  pattern: /\[\[[\s\S]*?\]\]/, group: 'span' },
+    { cls: 'tk-string',  pattern: /"(?:\\.|[^"\\\n])*"/, group: 'span' },
+    { cls: 'tk-string',  pattern: /'(?:\\.|[^'\\\n])*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /--.*/, group: 'span' },
     { cls: 'tk-var-builtin', pattern: /\b(?:self|_G|_VERSION)\b/ },
     { cls: 'tk-fn-decl',
       pattern: /(\bfunction\s+)[A-Za-z_]\w*(?:[.:][A-Za-z_]\w*)?/,
@@ -807,11 +1066,13 @@
   const SQL_BUILTINS = 'count sum avg min max coalesce nullif lower upper substr substring now date'.split(' ');
 
   G.sql = [
-    // Block comments before strings; line comments after strings so
-    // 'not -- a comment' stays a string.
-    { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\// },
-    { cls: 'tk-string', pattern: /'(?:''|[^'])*'|"(?:\\"|[^"])*"/ },
-    { cls: 'tk-comment', pattern: /--.*/ },
+    // Comments and strings compete by position (see `group` in tokenize), so
+    // 'not -- a comment' stays a string. This grammar's strings may span lines,
+    // which made the old order worse than elsewhere: `-- don't` opened a string
+    // that ran on until the next apostrophe anywhere below it.
+    { cls: 'tk-comment', pattern: /\/\*[\s\S]*?\*\//, group: 'span' },
+    { cls: 'tk-string', pattern: /'(?:''|[^'])*'|"(?:\\"|[^"])*"/, group: 'span' },
+    { cls: 'tk-comment', pattern: /--.*/, group: 'span' },
     { cls: 'tk-keyword', pattern: new RegExp('\\b(?:' + SQL_KEYWORDS.join('|') + ')\\b', 'i') },
     { cls: 'tk-fn-builtin', pattern: new RegExp('\\b(?:' + SQL_BUILTINS.join('|') + ')\\b', 'i') },
     { cls: 'tk-number', pattern: /-?\b\d+(?:\.\d+)?\b/ },
@@ -830,11 +1091,14 @@
     // and stopping early beats swallowing the rest of the document.
     { cls: 'tk-string',
       pattern: /(:[ \t]*)[|>][-+]?\d*[ \t]*(?:\n[ \t]+.*)*/,
-      lookbehind: true },
+      lookbehind: true,
+      group: 'span' },
 
-    // Strings before comments, else # inside "..." is eaten as a comment
-    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"|'(?:''|[^'\n])*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    // Strings, block scalars and comments compete by position (see `group` in
+    // tokenize): `#` inside "..." stays text, and a `key: |` written inside a
+    // comment opens nothing.
+    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"|'(?:''|[^'\n])*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-type', pattern: /^(\s*)[A-Za-z_][\w.-]*(?=\s*:)/m, lookbehind: true },
     { cls: 'tk-decorator', pattern: /[&*][A-Za-z_][\w-]*/ },
     { cls: 'tk-keyword', pattern: /\b(?:true|false|null|yes|no|on|off)\b/i },
@@ -887,9 +1151,9 @@
   ).split(' ');
 
   G.r = [
-    // Strings before comments, else # inside "..." is eaten as a comment
-    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    // Strings and comments compete by position (see `group` in tokenize)
+    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-fn-decl', pattern: /\b[A-Za-z._][\w.]*(?=\s*(?:<-|=)\s*function\b)/ },
     { cls: 'tk-keyword', pattern: wordPattern(R_KEYWORDS) },
     { cls: 'tk-fn-builtin',
@@ -915,14 +1179,22 @@
   ).split(' ');
 
   G.perl = [
-    { cls: 'tk-doc', pattern: /^=\w+[\s\S]*?^=cut\s*$/m },
-    // Strings before comments, else # inside "..." is eaten as a comment
-    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"/, inside: [
+    // POD, strings, quoting operators, comments and bound regexes compete by
+    // position (see `group` in tokenize). `#` is ordinary text inside a string,
+    // a `q{…}` or a `/#/`; a quote or a `q{` inside a comment is comment.
+    { cls: 'tk-doc', pattern: /^=\w+[\s\S]*?^=cut\s*$/m, group: 'span' },
+    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"/, group: 'span', inside: [
         { cls: 'tk-var', pattern: /[$@][A-Za-z_]\w*/ },
     ]},
-    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
-    { cls: 'tk-regex', pattern: /((?:=~|!~)\s*)(?:m|s|tr|y)?\/(?:\\.|[^/\n])*\/[a-z]*/, lookbehind: true },
+    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/, group: 'span' },
+
+    // q{…} qq{…} qw{…} qr{…}. `/` is excluded as a delimiter for the quoting
+    // forms: after a bare word it is far more often division.
+    { cls: 'tk-regex',  pattern: /\bqr[ \t]*([([{<|!\/])/, close: pairedEnd(1), group: 'span' },
+    { cls: 'tk-string', pattern: /\b(?:qq|qw|q)[ \t]*([([{<|!])/, close: pairedEnd(1), group: 'span' },
+
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
+    { cls: 'tk-regex', pattern: /((?:=~|!~)\s*)(?:m|s|tr|y)?\/(?:\\.|[^/\n])*\/[a-z]*/, lookbehind: true, group: 'span' },
     { cls: 'tk-var-builtin', pattern: /\$[_0-9&`'+^!]|\$\^\w|\@ARGV\b|\%ENV\b|\$0\b/ },
     { cls: 'tk-var', pattern: /\$#?[A-Za-z_]\w*|[@%][A-Za-z_]\w*|\$\{[^}]+\}/ },
     { cls: 'tk-fn-decl', pattern: /(\bsub\s+)[A-Za-z_]\w*/, lookbehind: true },
@@ -944,14 +1216,15 @@
   ).split(' ');
 
   G.powershell = [
-    // Block comments before strings; line comments after strings so
-    // "not # a comment" stays a string.
-    { cls: 'tk-comment', pattern: /<#[\s\S]*?#>/ },
-    { cls: 'tk-string', pattern: /"(?:`.|\$\w+|\$\{[^}]*\}|[^"`$\n])*"/, inside: [
+    // Comments and strings compete by position (see `group` in tokenize), so
+    // "not # a comment" stays a string. The block comment is listed ahead of
+    // the line comment so `<#` wins the tie over the `#` inside it.
+    { cls: 'tk-comment', pattern: /<#[\s\S]*?#>/, group: 'span' },
+    { cls: 'tk-string', pattern: /"(?:`.|\$\w+|\$\{[^}]*\}|[^"`$\n])*"/, group: 'span', inside: [
         { cls: 'tk-var-builtin', pattern: /\$\{[^}]+\}|\$\w+/ },
     ]},
-    { cls: 'tk-string', pattern: /'[^'\n]*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    { cls: 'tk-string', pattern: /'[^'\n]*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-decorator', pattern: /\[[A-Za-z][\w.]*(?:\(\)|\[\])?\]/ },
     { cls: 'tk-var-builtin', pattern: /\$(?:_|PSItem|PSScriptRoot|PSCommandPath|args|input|this|null|true|false|error|home|host|profile|pid|pwd)\b|\$env:\w+/i },
     { cls: 'tk-var', pattern: /\$\{[^}]+\}|\$\w+/ },
@@ -976,14 +1249,23 @@
   ).split(' ');
 
   G.elixir = [
-    { cls: 'tk-doc', pattern: /@(?:moduledoc|doc)\s+"""[\s\S]*?"""/ },
-    // Strings before comments, else # inside "..." (incl. #{} interpolation) is eaten
+    // Doc attributes, strings, sigils and comments compete by position (see
+    // `group` in tokenize): `#` inside "..." (incl. #{} interpolation) stays
+    // text, and a quote or a `~r/…/` inside a comment stays comment.
+    { cls: 'tk-doc', pattern: /@(?:moduledoc|doc)\s+"""[\s\S]*?"""/, group: 'span' },
     // Fallback and interpolation branch kept disjoint (see the JS template-string note).
-    { cls: 'tk-string', pattern: /"""[\s\S]*?"""|"(?:\\.|#\{[^}\n]*\}|#(?!\{)|[^"\\\n#])*"/, inside: [
+    { cls: 'tk-string', pattern: /"""[\s\S]*?"""|"(?:\\.|#\{[^}\n]*\}|#(?!\{)|[^"\\\n#])*"/, group: 'span', inside: [
         { cls: 'tk-operator', pattern: /#\{[^}\n]*\}/ },
     ]},
-    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    { cls: 'tk-string', pattern: /'(?:\\.|[^'\\\n])*'/, group: 'span' },
+
+    // Sigils ~s{…} ~w[…] ~r/…/. A `"` delimiter is not accepted here: it
+    // would end `~s"""…"""` at the second quote, and the triple-quote rule
+    // above already renders that form correctly.
+    { cls: 'tk-regex',  pattern: /~[rR]([([{<|\/'])/, close: pairedEnd(1), group: 'span' },
+    { cls: 'tk-string', pattern: /~[a-zA-Z]([([{<|\/'])/, close: pairedEnd(1), group: 'span' },
+
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-decorator', pattern: /@[a-z_]\w*/ },
     { cls: 'tk-var-const', pattern: /:[a-z_]\w*[?!]?/ },
     { cls: 'tk-fn-decl', pattern: /(\b(?:defp?|defmacrop?|defguard|defdelegate)\s+)[a-z_]\w*[?!]?/, lookbehind: true },
@@ -1009,11 +1291,11 @@
   ).split(' ');
 
   G.haskell = [
-    // Block comments before strings; line comments after strings so
-    // "not -- a comment" stays a string.
-    { cls: 'tk-comment', pattern: /\{-[\s\S]*?-\}/ },
-    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"/ },
-    { cls: 'tk-comment', pattern: /--.*/ },
+    // Comments and strings compete by position (see `group` in tokenize), so
+    // "not -- a comment" stays a string and a quote in a comment stays comment.
+    { cls: 'tk-comment', pattern: /\{-[\s\S]*?-\}/, group: 'span' },
+    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"/, group: 'span' },
+    { cls: 'tk-comment', pattern: /--.*/, group: 'span' },
     { cls: 'tk-fn-decl', pattern: /^[a-z_][\w']*(?=\s*::)/m },
     { cls: 'tk-keyword', pattern: wordPattern(HS_KEYWORDS) },
     { cls: 'tk-type', pattern: /\b[A-Z][\w']*/ },
@@ -1027,9 +1309,9 @@
   // GraphQL
   // ============================================================
   G.graphql = [
-    // Strings before comments so "not # a comment" stays a string.
-    { cls: 'tk-string', pattern: /"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    // Strings and comments compete by position (see `group` in tokenize).
+    { cls: 'tk-string', pattern: /"""[\s\S]*?"""|"(?:\\.|[^"\\\n])*"/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-decorator', pattern: /@[A-Za-z_]\w*/ },
     { cls: 'tk-var-param', pattern: /\$[A-Za-z_]\w*/ },
     { cls: 'tk-keyword', pattern: /\b(?:query|mutation|subscription|fragment|on|type|interface|union|enum|input|scalar|schema|directive|extend|implements|repeatable|true|false|null)\b/ },
@@ -1043,11 +1325,11 @@
   // TOML / INI
   // ============================================================
   G.toml = [
-    // Table headers first (they may contain quoted keys), then strings before
-    // comments, else # inside "..." is eaten as a comment
+    // Table headers first (they may contain quoted keys), then strings and
+    // comments competing by position (see `group` in tokenize).
     { cls: 'tk-tag', pattern: /^[ \t]*\[\[?[^\]\n]+\]\]?/m },
-    { cls: 'tk-string', pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'[^'\n]*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    { cls: 'tk-string', pattern: /"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\\\n])*"|'[^'\n]*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-type', pattern: /^(\s*)[A-Za-z0-9_.-]+(?=\s*=)/m, lookbehind: true },
     { cls: 'tk-keyword', pattern: /\b(?:true|false)\b/ },
     { cls: 'tk-number', pattern: /\d{4}-\d{2}-\d{2}(?:[T ][\d:.]+(?:Z|[+-]\d{2}:\d{2})?)?|[+-]?\b(?:0[xX][\da-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?|inf|nan)\b/ },
@@ -1069,9 +1351,9 @@
   // Dockerfile
   // ============================================================
   G.dockerfile = [
-    // Strings before comments so "not # a comment" stays a string.
-    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"|'[^'\n]*'/ },
-    { cls: 'tk-comment', pattern: /#.*/ },
+    // Strings and comments compete by position (see `group` in tokenize).
+    { cls: 'tk-string', pattern: /"(?:\\.|[^"\\\n])*"|'[^'\n]*'/, group: 'span' },
+    { cls: 'tk-comment', pattern: /#.*/, group: 'span' },
     { cls: 'tk-keyword', pattern: /^\s*(?:FROM|RUN|CMD|LABEL|MAINTAINER|EXPOSE|ENV|ADD|COPY|ENTRYPOINT|VOLUME|USER|WORKDIR|ARG|ONBUILD|STOPSIGNAL|HEALTHCHECK|SHELL)\b|\bAS\b/m },
     { cls: 'tk-var-builtin', pattern: /\$\{[^}]+\}|\$\w+/ },
     { cls: 'tk-decorator', pattern: /(^|\s)--[\w-]+(?==|\s|$)/, lookbehind: true },
@@ -1494,25 +1776,367 @@
     set('--jr-gutter-fg', themeBlock.gutter);
     set('--jr-line-hl',   themeBlock.lineHighlight);
     const tokens = themeBlock.tokens || {};
-    // Fallback chain: a missing refined key resolves through its base
-    // (function.declaration → function), so palettes that predate a newly
-    // added key keep working — the vocabulary can grow in minor versions.
-    const resolveColor = (key) => {
-      let k = key;
-      while (k) {
-        const tok = tokens[k];
-        if (tok && tok.color) return tok.color;
-        const dot = k.lastIndexOf('.');
-        k = dot === -1 ? '' : k.slice(0, dot);
-      }
-      return null;
-    };
+    // The fallback chain lives in resolveToken, shared with renderPortable.
+    // Two renderers resolving the same palette by two implementations is how
+    // they drift apart, and this one had the only copy of it.
     for (const key in THEME_ALIAS) {
-      const color = resolveColor(key);
-      if (color) {
-        set('--jr-' + THEME_ALIAS[key], color);
-      }
+      const tok = resolveToken(tokens, key);
+      if (tok) set('--jr-' + THEME_ALIAS[key], tok.color);
     }
+  }
+
+  /**
+   * Resolve a palette key to a token's style, following the fallback chain.
+   *
+   * Shared by every renderer: a refined key that a palette predates resolves
+   * through its base (`function.declaration` → `function`), which is what lets
+   * the vocabulary grow in a minor version without breaking older palettes.
+   *
+   * @param {object} tokens Palette `tokens` block.
+   * @param {string} key Palette key.
+   * @returns {{color: string, fontStyle?: string}|null}
+   */
+  function resolveToken(tokens, key) {
+    let k = key;
+    while (k) {
+      const tok = tokens[k];
+      if (tok && tok.color) return tok;
+      const dot = k.lastIndexOf('.');
+      k = dot === -1 ? '' : k.slice(0, dot);
+    }
+    return null;
+  }
+
+  // Class suffix back to palette key — THEME_ALIAS read the other way. The
+  // token stream carries `tk-fn-decl`; a palette is keyed `function.declaration`.
+  const KEY_BY_SUFFIX = {};
+  for (const key in THEME_ALIAS) KEY_BY_SUFFIX[THEME_ALIAS[key]] = key;
+
+  /**
+   * Render to HTML that carries its own styling and needs no stylesheet.
+   *
+   * The third consumer of the token stream, beside `render()` and the terminal's
+   * ANSI writer. It exists for the case a plugin cannot reach: code pasted into
+   * somebody else's site, where `class="tk-keyword"` means nothing because
+   * jsray.css was never loaded, and where a rich-text editor strips `<style>`
+   * blocks and class attributes but keeps inline `style`.
+   *
+   * Costs about 40% more bytes than the class-based output and roughly twelve
+   * times the source — a twenty-line snippet lands near 7 KB, which is nothing
+   * to paste and a lot to serve, so this is for copying, not for pages that
+   * could link a stylesheet instead.
+   *
+   * Two limits are inherent rather than temporary. A pasted block cannot follow
+   * the host's light/dark setting, because inline styles are fixed at the moment
+   * of copying — the caller picks a theme block and that is the one that
+   * travels. And anything the destination's sanitizer strips is gone; inline
+   * `style` on `span` and `pre` survives the widest range, which is why nothing
+   * here depends on a class, a stylesheet, or a wrapper more elaborate than
+   * `<pre><code>`.
+   *
+   * @param {string} code Source text.
+   * @param {string} language Language id or alias.
+   * @param {object} themeBlock A palette's `dark` or `light` block.
+   * The container's own declarations always carry `!important`, because that
+   * is the only weight that survives a host stylesheet doing the same. Set
+   * `important` to extend it to the token colours as well, for a destination
+   * whose CSS reaches into spans.
+   *
+   * `frame` puts the code in a window: `header` is jsray-wp's own bar, so a
+   * block copied from here matches one the plugin rendered; `macos` is the
+   * three dots; `minimal` is a hairline strip. `title` and `label` fill it —
+   * `label` defaults to the language's display name.
+   *
+   * @param {{padding?: string, radius?: string, font?: string,
+   *          important?: boolean, frame?: 'none'|'header'|'macos'|'minimal',
+   *          title?: string, label?: string}} [options]
+   * @returns {string} A self-contained element: a `<pre>`, or a `<div>` around
+   *   one when a frame is asked for.
+   */
+  /**
+   * Blend two colours the way `color-mix()` would, but at render time.
+   *
+   * The plugin's stylesheet derives its chrome from the palette with
+   * `color-mix(in srgb, var(--jr-bg) 88%, var(--jr-fg) 12%)`. A pasted block
+   * has neither the custom properties nor a guarantee the destination's browser
+   * supports the function, so the same arithmetic happens here and ships a
+   * plain hex. Anything that is not a hex triple is returned as-is rather than
+   * guessed at — a palette may legitimately carry `rgba()`.
+   */
+  function mixHex(base, other, percentOfBase) {
+    const parse = (hex) => {
+      const s = String(hex).trim();
+      const m = /^#([\da-f]{3}|[\da-f]{6})$/i.exec(s);
+      if (!m) return null;
+      const h = m[1].length === 3 ? m[1].replace(/./g, (c) => c + c) : m[1];
+      return [
+        parseInt(h.slice(0, 2), 16),
+        parseInt(h.slice(2, 4), 16),
+        parseInt(h.slice(4, 6), 16),
+      ];
+    };
+
+    const a = parse(base);
+    const b = parse(other);
+    if (!a || !b) return base;
+
+    const w = Math.max(0, Math.min(1, percentOfBase / 100));
+    const channel = (i) => Math.round(a[i] * w + b[i] * (1 - w));
+    return '#' + [0, 1, 2]
+      .map((i) => channel(i).toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  /**
+   * "javascript" → "JavaScript", for the label a frame puts in its header.
+   *
+   * Two hops, because normalizeLanguage deliberately leaves some names alone:
+   * `c++` resolves through LANGUAGE_ALIASES to `cpp`, while `js` and `ts` have
+   * grammars registered under their own names so a TypeScript block stays
+   * labelled TypeScript — those need naming here directly. Anything unlisted
+   * is upper-cased, which reads correctly far more often than not (TOML, INI,
+   * GraphQL) and is never wrong enough to matter.
+   */
+  function languageLabel(lang) {
+    // What the caller said comes first: `jsx` collapses to `javascript` for
+    // grammar purposes, but someone who wrote jsx wants to see JSX.
+    const raw = String(lang || '').toLowerCase().replace(/^(?:language|lang)-/, '');
+    if (LANGUAGE_LABELS[raw]) return LANGUAGE_LABELS[raw];
+
+    const key = normalizeLanguage(lang);
+    if (!key) return '';
+    const canonical = LANGUAGE_ALIASES[key] || key;
+    return LANGUAGE_LABELS[key] || LANGUAGE_LABELS[canonical] || key.toUpperCase();
+  }
+
+  const LANGUAGE_LABELS = {
+    javascript: 'JavaScript', js: 'JavaScript',
+    typescript: 'TypeScript', ts: 'TypeScript',
+    jsx: 'JSX', tsx: 'TSX', vue: 'Vue',
+    python: 'Python', ruby: 'Ruby', rust: 'Rust', go: 'Go', java: 'Java',
+    kotlin: 'Kotlin', swift: 'Swift', dart: 'Dart', scala: 'Scala',
+    c: 'C', cpp: 'C++', csharp: 'C#', objectivec: 'Objective-C',
+    php: 'PHP', lua: 'Lua', perl: 'Perl', r: 'R',
+    elixir: 'Elixir', haskell: 'Haskell',
+    shell: 'Shell', powershell: 'PowerShell',
+    html: 'HTML', xml: 'XML', svg: 'SVG',
+    css: 'CSS', scss: 'Sass', sass: 'Sass', less: 'Less',
+    json: 'JSON', jsonc: 'JSON', yaml: 'YAML', toml: 'TOML', ini: 'INI',
+    sql: 'SQL', graphql: 'GraphQL', markdown: 'Markdown',
+    dockerfile: 'Dockerfile', makefile: 'Makefile', diff: 'Diff',
+  };
+
+  /**
+   * The window each block sits in. Every frame is a header strip above the
+   * code; the wrapper around them carries the border and the radius, so a
+   * frame only has to describe its own row.
+   *
+   * All of it is inline-styled for the same reason the code is — a pasted
+   * block has no stylesheet at the destination.
+   */
+  /* The chrome defends itself for the same reason the container does: a host
+     rule at !important weight beats an inline style, and a frame that loses
+     its background is a frame that looks broken rather than plain. The
+     `important` option stays what it was — a choice about the token colours. */
+  const IMPORTANT = '!important';
+
+  const FRAMES = {
+    /* jsray-wp's own header: bold title on the left, language on the right.
+       Matching the plugin means a block copied from the site and a block the
+       plugin renders look like the same product. The plugin's Copy button is
+       deliberately absent: nothing here can run script at the destination, and
+       a button that does nothing is worse than no button. */
+    header: (c) => {
+      const row = [
+        'display:flex', 'align-items:center', 'gap:10px', 'min-height:40px',
+        'padding:0 14px', 'background:' + c.headerBg, 'color:' + c.fg,
+        'border-bottom:1px solid ' + c.edge,
+        'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+      ].map((d) => d + IMPORTANT).join(';');
+
+      const title = c.title
+        ? '<span style="font-weight:700' + IMPORTANT + ';overflow:hidden' + IMPORTANT +
+          ';text-overflow:ellipsis' + IMPORTANT + ';white-space:nowrap' + IMPORTANT +
+          '">' + escapeHtml(c.title) + '</span>'
+        : '';
+
+      const label = c.label
+        ? '<span style="margin-left:auto' + IMPORTANT + ';color:' + c.muted + IMPORTANT +
+          ';font-size:11px' + IMPORTANT + ';letter-spacing:.06em' + IMPORTANT +
+          ';text-transform:uppercase' + IMPORTANT + '">' + escapeHtml(c.label) + '</span>'
+        : '';
+
+      return '<div style="' + row + '">' + title + label + '</div>';
+    },
+
+    /* Three dots and a centred caption. The dots are spans with a background
+       and a radius rather than an image, so nothing has to load at the
+       destination for the frame to read as a window. */
+    macos: (c) => {
+      const row = [
+        'display:flex', 'align-items:center', 'gap:8px', 'min-height:38px',
+        'padding:0 14px', 'background:' + c.headerBg,
+        'border-bottom:1px solid ' + c.edge,
+        'font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+      ].map((d) => d + IMPORTANT).join(';');
+
+      const dot = (colour) => '<span style="width:11px' + IMPORTANT + ';height:11px' +
+        IMPORTANT + ';border-radius:50%' + IMPORTANT + ';display:inline-block' + IMPORTANT +
+        ';background:' + colour + IMPORTANT + '"></span>';
+
+      const caption = (c.title || c.label)
+        ? '<span style="margin:0 auto' + IMPORTANT + ';color:' + c.muted + IMPORTANT +
+          ';padding-right:45px' + IMPORTANT + ';overflow:hidden' + IMPORTANT +
+          ';text-overflow:ellipsis' + IMPORTANT + ';white-space:nowrap' + IMPORTANT +
+          '">' + escapeHtml(c.title || c.label) + '</span>'
+        : '';
+
+      return '<div style="' + row + '">' +
+        dot('#FF5F57') + dot('#FEBC2E') + dot('#28C840') + caption + '</div>';
+    },
+
+    /* A single hairline strip carrying only the language — the least chrome
+       that still reads as a deliberate window rather than a bare rectangle. */
+    minimal: (c) => {
+      const row = [
+        'display:flex', 'align-items:center', 'min-height:28px',
+        'padding:0 16px', 'background:' + c.headerBg,
+        'border-bottom:1px solid ' + c.edge, 'color:' + c.muted,
+        'font:10.5px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+        'letter-spacing:.1em', 'text-transform:uppercase',
+      ].map((d) => d + IMPORTANT).join(';');
+
+      return '<div style="' + row + '">' + escapeHtml(c.title || c.label) + '</div>';
+    },
+  };
+
+  function renderPortable(code, language, themeBlock, options) {
+    const theme = themeBlock || {};
+    const tokens = theme.tokens || {};
+    const opts = options || {};
+
+    // Off by default: it costs ~11 bytes per token and only matters against a
+    // host that sets `!important` on spans themselves, which is rare — the
+    // container already defends the things whose loss actually breaks the block.
+    const bang = opts.important ? '!important' : '';
+
+    const paint = (node) => {
+      if (typeof node === 'string') return escapeHtml(node);
+      if (Array.isArray(node)) return node.map(paint).join('');
+
+      const inner = typeof node.content === 'string'
+        ? escapeHtml(node.content)
+        : paint(node.content);
+
+      const key = KEY_BY_SUFFIX[String(node.type).replace(/^tk-/, '')];
+      const tok = key ? resolveToken(tokens, key) : null;
+
+      // An unstyled token is emitted as bare text rather than an empty span:
+      // the wrapper would carry no colour and only cost bytes.
+      if (!tok) return inner;
+
+      let style = 'color:' + tok.color + bang;
+      const fontStyle = tok.fontStyle || '';
+      if (fontStyle.indexOf('bold') !== -1) style += ';font-weight:700' + bang;
+      if (fontStyle.indexOf('italic') !== -1) style += ';font-style:italic' + bang;
+
+      return '<span style="' + style + '">' + inner + '</span>';
+    };
+
+    // The internal tokenize takes a grammar, not a language name — resolving it
+    // here is what the public tokenize() does, and an unknown language has to
+    // degrade to plain text rather than throw.
+    const grammar = G[normalizeLanguage(language)];
+    const body = paint(grammar ? tokenize(code, grammar) : [String(code)]);
+
+    // The container is inline-styled for the same reason the tokens are: the
+    // background and the monospace stack have to survive the trip too, or the
+    // block arrives as coloured text in the host's body font.
+    //
+    // These carry !important unconditionally, which is the one thing that wins
+    // against a host stylesheet. Inline styles beat everything an author writes
+    // at normal weight, but an author's !important beats inline — and themes
+    // really do ship `pre { white-space: pre-wrap !important }` to stop code
+    // scrolling on phones. That single rule reflows the block and destroys the
+    // alignment, so the container defends itself for the ~80 bytes it costs.
+    const bg = theme.background || '#1C1C1E';
+    const fg = theme.foreground || '#E1E4E8';
+    const edge = theme.border || mixHex(bg, fg, 88);
+    const radius = opts.radius || '8px';
+
+    const frame = FRAMES[opts.frame] ? opts.frame : 'none';
+    const framed = frame !== 'none';
+
+    const shell = [
+      'background:' + bg,
+      'color:' + fg,
+      'padding:' + (opts.padding || '16px 18px'),
+      // Inside a frame the corners belong to the wrapper, or the code's own
+      // rounding cuts a notch out of the header sitting directly above it.
+      'border-radius:' + (framed ? '0' : radius),
+      'overflow-x:auto',
+      'font:' + (opts.font || '13px/1.65 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace'),
+      // Explicit, because a host that sets `pre-wrap` would reflow the code.
+      'white-space:pre',
+      'margin:0',
+      // jsray.css gives a block a restrained 8px scrollbar through
+      // ::-webkit-scrollbar, and a pseudo-element cannot be written inline —
+      // so a pasted block was left with the browser's default, a bright slab
+      // across the foot of a dark rectangle. These two are real properties and
+      // say the same thing; where they are not supported the block simply
+      // keeps the scrollbar it would have had.
+      'scrollbar-width:thin',
+      'scrollbar-color:' + edge + ' ' + bg,
+    ];
+
+    // An unframed block still wants an edge: on a host whose background is
+    // close to the palette's, a borderless rectangle has nothing to say where
+    // it starts.
+    if (!framed) shell.push('border:1px solid ' + edge);
+
+    // The marker keeps highlightAll() off this block. Without it the auto-scan
+    // matches `pre > code`, re-renders the code in class form, and the inline
+    // colours this whole function exists to produce are gone. A destination
+    // that strips data attributes falls back to being re-highlighted in that
+    // site's own palette, which is wrong but still legible.
+    // The inner <code> needs the same weight as the <pre>. Styling `code` with
+    // a background is one of the most common things a blog theme does, and at
+    // !important it paints a band behind every line of the block; the same rule
+    // usually sets a colour, which then shows through on any token the palette
+    // leaves unstyled. Both were visible before this carried !important.
+    const inner = [
+      'font:inherit',
+      'color:inherit',
+      'background:none',
+      'padding:0',
+      'border:0',
+    ].map((d) => d + '!important').join(';');
+
+    const pre = '<pre data-jsray-portable style="' +
+      shell.map((d) => d + '!important').join(';') +
+      '"><code style="' + inner + '">' + body + '</code></pre>';
+
+    if (!framed) return pre;
+
+    const chrome = FRAMES[frame]({
+      bg,
+      fg,
+      edge,
+      radius,
+      muted: mixHex(fg, bg, 58),
+      headerBg: mixHex(bg, fg, 88),
+      title: opts.title || '',
+      label: opts.label === undefined ? languageLabel(language) : opts.label,
+    });
+
+    // overflow:hidden is what makes the wrapper's radius clip the square
+    // corners of the header and the code beneath it.
+    return '<div data-jsray-portable style="' + [
+      'border:1px solid ' + edge,
+      'border-radius:' + radius,
+      'overflow:hidden',
+      'background:' + bg,
+    ].map((d) => d + '!important').join(';') + '">' + chrome + pre + '</div>';
   }
 
   // ============================================================
@@ -1523,7 +2147,7 @@
      * Runtime version, for shell/core compatibility negotiation.
      * Must match version.json — tools/check-versions.mjs asserts it.
      */
-    version: '0.0.2-beta.1',
+    version: '0.0.2-beta.5',
     languages: G,
     normalizeLanguage,
     detectLanguage,
@@ -1563,6 +2187,28 @@
       return render(stream);
     },
 
+    /**
+     * Render to HTML that carries its own styling and needs no stylesheet.
+     *
+     * For code that leaves this page: pasted into a rich-text editor, a CMS,
+     * a newsletter — anywhere `class="tk-keyword"` resolves to nothing because
+     * jsray.css was never loaded. Editors that strip `<style>` blocks and class
+     * attributes generally keep inline `style`, which is the whole basis of it.
+     *
+     * `themeBlock` is a palette's `dark` or `light` block, e.g.
+     * `tokens.json`'s `themes.dark`. It has to be chosen at call time: inline
+     * styles are fixed once written, so a pasted block cannot follow the
+     * destination's light/dark setting the way a plugin-rendered one does.
+     *
+     * @param {string} code
+     * @param {string} lang
+     * @param {object} themeBlock
+     * @param {{padding?: string, radius?: string, font?: string}} [options]
+     */
+    renderPortable(code, lang, themeBlock, options) {
+      return renderPortable(code, lang, themeBlock, options);
+    },
+
     /** Highlight a code string into an HTML string (tokenize + render) */
     highlight(code, lang) {
       const normalized = normalizeLanguage(lang);
@@ -1587,6 +2233,10 @@
     highlightAll(root) {
       const scope = root || document;
       scope.querySelectorAll('code[class*="language-"], code[class*="lang-"], pre > code').forEach((el) => {
+        // A block from renderPortable() already carries its colours inline.
+        // Re-rendering it would swap them for classes and strip the styling
+        // on any page that has no jsray.css — which is most of them.
+        if (el.closest && el.closest('[data-jsray-portable]')) return;
         this.highlightElement(el);
       });
     },
