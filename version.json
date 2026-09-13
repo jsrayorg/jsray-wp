@@ -1,7 +1,7 @@
 {
   "project": "jsray-wp",
   "name": "JSRay WordPress Plugin",
-  "version": "0.0.1-beta",
+  "version": "0.0.2-beta",
   "channel": "beta",
   "publicBetaReleased": true,
   "bundledCore": {

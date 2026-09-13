@@ -3,7 +3,7 @@
  * Plugin Name: JSRay
  * Plugin URI: https://jsray.org
  * Description: JSRay Core rendering for WordPress code blocks.
- * Version: 0.0.1-beta
+ * Version: 0.0.2-beta
  * Author: Jie
  * Author URI: https://jsray.org
  * License: GPLv2 or later
@@ -38,7 +38,7 @@ if (! defined('ABSPATH')) {
 	exit;
 }
 
-define('JSRAY_WP_VERSION', '0.0.1-beta');
+define('JSRAY_WP_VERSION', '0.0.2-beta');
 define('JSRAY_WP_FILE', __FILE__);
 define('JSRAY_WP_DIR', plugin_dir_path(__FILE__));
 define('JSRAY_WP_URL', plugin_dir_url(__FILE__));

@@ -4,7 +4,7 @@ Tags: code rendering, code blocks, gutenberg, syntax highlighting, developer too
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 0.0.1-beta
+Stable tag: 0.0.2-beta
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
