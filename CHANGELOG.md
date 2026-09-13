@@ -9,6 +9,45 @@ versioning follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.0.2-beta] — 2026-09-13
+
+Bundles JSRay Core 0.0.2-beta.5, the last beta of Core's 0.0.2 line.
+
+### Added
+- **Sass and Less in the block's language picker.** Core recognised both; the
+  picker listed SCSS alone.
+
+### Changed
+- **Bundled Core is 0.0.2-beta.5.** The 0.0.1-beta zip shipped 0.0.1-beta.5;
+  the 0.0.2-beta.1 recorded below was synced afterwards and never reached a
+  released zip. On a site:
+  - A comment holding two quotes stays one comment, and a string holding `//`,
+    `#` or `/* */` stays one string, in every grammar. 27 grammars used to cut
+    a comment such as `// don't stop, won't stop` at its first apostrophe.
+  - PHP heredocs and nowdocs, shell and Ruby heredocs, Ruby's `%w[]` family,
+    Perl's `q{}` family and Elixir sigils render as literals instead of as code.
+  - A JavaScript template nested inside a placeholder no longer ends the outer
+    one early, and private class members such as `#count` are coloured.
+- **Core drift is reported, not failed on.** CI warns while the bundled Core is
+  behind the published one and stays green; `npm run build` keeps the strict
+  check, because an integration syncs Core when it releases, not when Core does.
+  CI had been running that strict gate on every push, which went unnoticed until
+  Core first moved ahead; it now calls the packaging script directly.
+- The sync workflow retires what a newer Core makes obsolete — its own issues
+  and `core/*` branches — instead of leaving one of each per Core release.
+- Install points at the release zip and the `SHA256SUMS.txt` beside it, and
+  every link names the `jsrayorg` organisation.
+
+### Fixed
+- Both READMEs described an internal test build with no public beta through the
+  whole public beta. The phase check only asked whether the right phrase was
+  present; it now also fails while the wrong one is.
+- The banner, icon and screenshots WordPress.org renders existed nowhere. They
+  are in `.wordpress-org/`, for the SVN `assets/` folder beside `trunk/`.
+- A version ladder in CONTRIBUTING contradicted the paragraph above it.
+- Commit subjects are checked here and on pull requests, not only in Core and
+  not only by the local hook.
+
 ## [0.0.1-beta] — 2026-08-24
 
 Continues the 0.0.1 beta line. The major version tracks the bundled Core's, so this stays on 0.x until Core reaches 1.0, and the beta label stays until the plugin's own surface has stopped moving.

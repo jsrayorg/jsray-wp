@@ -129,6 +129,13 @@ replace the rendering engine while keeping the block UI, settings, and markup.
 
 == Changelog ==
 
+= 0.0.2-beta =
+* Bundled JSRay Core 0.0.2-beta.5.
+* A code comment holding two quotes stays one comment, and a string holding a comment marker stays one string, in every language. Many languages used to cut a comment such as "don't stop, won't stop" at its first apostrophe.
+* PHP heredocs and nowdocs, shell and Ruby heredocs, Ruby %w[] literals, Perl q{} literals and Elixir sigils are coloured as literals.
+* A JavaScript template nested inside a placeholder no longer ends the outer template early, and private class members such as #count are coloured.
+* Added Sass and Less to the block's language picker.
+
 = 0.0.1-beta =
 * Shortcodes now render through the same path as the block, so they get the block stylesheet — previously the markup carried JSRay classes with no CSS behind it.
 * Shortcodes gained what blocks already had: filename, copy button, line numbers, a highlight="3,7-9" line spec, and a custom class.
@@ -168,6 +175,9 @@ replace the rendering engine while keeping the block UI, settings, and markup.
 * Initial WordPress plugin wrapper for JSRay.
 
 == Upgrade Notice ==
+
+= 0.0.2-beta =
+Bundles JSRay Core 0.0.2-beta.5, which stops comments and strings cutting each other in every supported language, and adds Sass and Less to the language picker.
 
 = 0.0.1-beta =
 First public beta. Bundles JSRay Core 0.0.1-beta.5, which corrects eight literal forms that were previously mis-coloured — Rust lifetimes, Go and C++ raw strings, Java text blocks, numeric type suffixes and Python f-strings — and adds twenty keywords from recent language versions.
