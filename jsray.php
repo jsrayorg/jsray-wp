@@ -326,6 +326,8 @@ function jsray_wp_supported_languages() {
 		'vue'        => __('Vue', 'jsray'),
 		'css'        => __('CSS', 'jsray'),
 		'scss'       => __('SCSS', 'jsray'),
+		'sass'       => __('Sass', 'jsray'),
+		'less'       => __('Less', 'jsray'),
 		'json'       => __('JSON', 'jsray'),
 		'jsonc'      => __('JSONC', 'jsray'),
 		'bash'       => __('Bash', 'jsray'),
